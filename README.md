@@ -69,14 +69,14 @@ An earlier run of `nilo-dlmm-pick.js` on a later block gave 412,835 vs 439,653 (
 3. **Otherwise, the best active-bin price for the taker wins:** fewest sats per STX when selling sBTC, most when selling STX. Ties go to the lower number, as before.
 4. **Cheap pricing.** One `get-bin-factors-by-step u15` read of the core's factor list, then each eligible pool's `get-pool-for-swap` (not `get-pool`, which also reads the 4 KB `dynamic-config`). The price is computed inline the way core `get-bin-price` does (`initial-price × factor[bin+500] / 1e8`). All three pools are bps-15 and `bin-step` is only set at `create-pool`. A pool with another bin step gets no quote and so cannot be picked over one that has one.
 
-**Cost of the pick, isolated.**  runs a third variant, , where  is the constant : the same swap on the same pool with no pick at all. Fix and  see identical fork state, so their difference is the pick alone ([fix](https://stxer.xyz/simulations/mainnet/95207f447e416c7d318b94cfcc88f479), [always-v1](https://stxer.xyz/simulations/mainnet/767e5cb60477949d6e642e59da60dea3), [df091b8](https://stxer.xyz/simulations/mainnet/f2cc869e3b13a7909ca8a5260dd037ad), same block):
+**Cost of the pick, isolated.** `nilo-dlmm-pick-compare.js` runs a third variant, `always-v1`, where `dlmm-pick` is the constant `u1`: the same swap on the same pool with no pick at all. Fix and `always-v1` see identical fork state, so their difference is the pick alone ([fix](https://stxer.xyz/simulations/mainnet/95207f447e416c7d318b94cfcc88f479), [always-v1](https://stxer.xyz/simulations/mainnet/767e5cb60477949d6e642e59da60dea3), [df091b8](https://stxer.xyz/simulations/mainnet/f2cc869e3b13a7909ca8a5260dd037ad), same block):
 
 | leg | what the fix does | fix minus always-v1: runtime / read_count / read_length |
 |---|---|---|
-| A sells 1,000 STX (v-1 and v-2 both eligible) | 3 balances + factor list + 2 pool reads | +400,790 / +37 / +168,584 |
+| A sells 1,000 STX (v-1 and v-2 both eligible) | 3 balances + factor list + one read per eligible pool | +400,790 / +37 / +168,584 |
 | C sells 100,000 sats (only v-1 eligible) | 3 balances, no price read | +20,391 / +3 / +2,952 |
 
-df091b8's own pick is the 3 balance reads, i.e. the C row. So **against df091b8 the fix adds about +380 k runtime and +34 reads per pick when two pools compete, and nothing when one pool is eligible.** In  the pick runs twice per DLMM stage (capacity, then swap). Caching it in  and passing it to  would halve that, at the cost of touching private leg signatures. A first version that priced each pool through  + core  cost about twice as much.
+df091b8's own pick is the 3 balance reads, i.e. the C row. So **against df091b8 the fix adds about +380 k runtime and +34 reads per pick when two pools compete, and nothing when one pool is eligible.** In `smart-swap` the pick runs twice per DLMM stage (capacity, then swap). Caching it in `dlmm-stage` and passing it to `amm-leg` would halve that, at the cost of touching private leg signatures. A first version that priced each pool through `get-pool` + core `get-bin-price` cost about twice as much.
 
 Not addressed here: picking by price **at the caller's limit** (walking the capacity of all three pools and splitting across them) would fill more, but costs three bin walks. The patch is the minimal change that stops the router from preferring a pool whose price is off-market.
 
