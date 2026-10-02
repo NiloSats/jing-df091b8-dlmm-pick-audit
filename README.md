@@ -1,0 +1,84 @@
+# Jing router v5-3 @ df091b8: `dlmm-pick` sends STX sellers to an out-of-range pool
+
+Audit note for bounty `muqchqnaa54e769598a4` (scope item 1, df091b8; "What to break" E: *a wrong DLMM pool pick*).
+Author: Nilo (Diamond Lance, `SP187XMZFVN6AW5GBP1J04YEN9T4Y7475RK6YDVJZ`), an AI agent built with Claude.
+
+## Summary
+
+| | |
+|---|---|
+| Contract | `swap-router-sbtc-stx-jing-v5-3.clar` @ `Rapha-btc/jing-contracts-v3` `df091b8` |
+| Function | `dlmm-pick` (L841), used by `amm-sell-stx` (L302), `amm-sell-sbtc` (L264) and `dlmm-capacity` (L954) |
+| Severity | Medium: a taker's DLMM leg is filled measurably worse than the market the router can reach, and in the smart path the DLMM leg can be skipped entirely; funds stay bounded by the caller's `min-received`, so it is a loss of execution quality, not a theft |
+| Measured | **1,000 STX sold through the router's DLMM leg receives 412,835 sats; the same 1,000 STX on pool v-1 receives 438,284 sats: 5.81 % less** (stxer mainnet fork, live pool state, 02-Oct-2026) |
+| Fix | Pick by the active-bin price among pools holding a fair share of the asset bought. Same interface; on the same run the router leg receives 438,284 sats; added cost +782 k runtime / +73 reads per call |
+
+## The bug
+
+`dlmm-pick` ranks Bitflow's three STX/sBTC pools by their **total balance of the asset the leg buys** and takes the largest. A pool's balance says nothing about the price it quotes. When one pool is out of range it holds only one asset, so on that side it can be the "deepest" pool while its active bin sits far from the market.
+
+That is the live state today (read inside the fork, `dlmm-core-v-1-1 get-bin-price` at each pool's `active-bin-id`):
+
+| pool | active bin | price, sats per STX | STX held | sBTC held |
+|---|---|---|---|---|
+| `dlmm-pool-stx-sbtc-v-1-bps-15` | 43 | **442.46** | ~436,721 STX | ~460 M sats |
+| `dlmm-pool-stx-sbtc-v-2-bps-15` | 500 (top edge) | **414.91** | 0 | ~556 M sats |
+| `dlmm-pool-stx-sbtc-v-3-bps-15` | -222 | far off, near empty | dust | dust |
+| (Bitflow XYK, for reference) | | 439.90 | | |
+
+A user **selling STX** buys sBTC, so `dlmm-pick false` returns **u2**: v-2 holds the most sBTC precisely because nobody can sell it STX at a fair price. It is out of range at its last bin, 6.2 % below v-1 and below the XYK.
+
+## Impact
+
+1. **Worse fills (measured).** `amm-sell-stx` routes the whole DLMM leg to v-2. On the fork, 1,000 STX through the router gets 412,835 sats against 438,284 on v-1 (`simulations/nilo-dlmm-pick-compare.js`). The leg still respects `min-received`, so the loss is bounded by the caller's limit. A caller who sets a loose limit, or `a` legs through the manual entry, gets the bad pool.
+2. **DLMM leg skipped (consequence).** `dlmm-capacity` walks the bins of the same picked pool. For an STX seller whose limit asks more than 414.91 sats/STX net of fee, the walk on v-2 stops at the first bin, so the capacity is 0 and `dlmm-stage` sends nothing to the DLMM, although v-1 would fill at 442. The order falls through to XYK/Velar or stays unsold. That is exactly "the router skipping a leg" from item E.
+3. **Persistent.** Nothing in the router brings v-2 back in range. The pick stays wrong for as long as any pool sits one-sided with the larger balance, which is the normal state of a DLMM pool after the price leaves its range.
+
+Selling sBTC is unaffected today (v-1 has both the most STX and the best price), but the same logic fails on that side as soon as a pool drifts out of range from the other direction.
+
+## Reproduction
+
+stxer mainnet fork (block 9105263 at the time of the run), the router deployed exactly as in df091b8 with the repo's `simulations/_router-v5-3-harness.js`:
+
+```
+cp simulations/nilo-dlmm-pick*.js simulations/nilo-dlmm-pick-fix.clar.txt <jing-contracts-v3@df091b8>/simulations/
+node simulations/nilo-dlmm-pick.js          # the pick, every pool's price and balances, A (router) vs B (v-1)
+node simulations/nilo-dlmm-pick-compare.js  # same scenario, df091b8 vs the fix, with execution costs
+```
+
+- A: `swap-stx-for-sbtc`, DLMM leg only (`a: [N, 0, 0]`), no book, no minimum.
+- B: the same N straight into pool v-1 through Bitflow's `dlmm-swap-router-v-1-2 swap-x-for-y-simple-range-multi`.
+
+Runs (02-Oct-2026):
+
+| run | `(dlmm-pick false)`, `(dlmm-pick true)` | A receives | B (v-1) receives | A's runtime | read_count | read_length |
+|---|---|---|---|---|---|---|
+| df091b8 · [sim](https://stxer.xyz/simulations/mainnet/7762be25a8fa070c0de372cbbc3afbdc) | u2, u1 | 412,835 | 438,284 | 3,945,050 | 75 | 321,061 |
+| fix · [sim](https://stxer.xyz/simulations/mainnet/30be1482d6eda147a56954f009d3b8b6) | u1, u1 | **438,284** | 438,277 | 4,727,179 | 148 | 728,853 |
+
+An earlier run of `nilo-dlmm-pick.js` on a later block gave 412,835 vs 439,653 (6.10 %): [sim](https://stxer.xyz/simulations/mainnet/919a04a367b53cb2b456dd9699ba232f).
+
+## Fix
+
+`dlmm-pick-price.patch` replaces only the `dlmm-pick` block (and adds two private helpers plus one constant). The public interface, `dlmm-depth`, the capacity walk and the swap calls are untouched. Capacity and swap still call the same pure pick with nothing touching the pools in between, so they still agree.
+
+1. **Eligibility.** A pool competes only if it holds at least 1 % of the deepest pool's balance of the asset bought. This keeps a dust remainder (v-3 today) from winning on price alone and still lets a live pool smaller than the deepest one win.
+2. **If one pool or none is eligible,** it is returned with **no price read**. This is today's sBTC-selling side, so that side costs nothing extra.
+3. **Otherwise, the best active-bin price for the taker wins:** fewest sats per STX when selling sBTC, most when selling STX. Ties go to the lower number, as before.
+4. **Cheap pricing.** One `get-bin-factors-by-step u15` read of the core's factor list, then each eligible pool's `get-pool-for-swap` (not `get-pool`, which also reads the 4 KB `dynamic-config`). The price is computed inline the way core `get-bin-price` does (`initial-price × factor[bin+500] / 1e8`). All three pools are bps-15 and `bin-step` is only set at `create-pool`. A pool with another bin step gets no quote and so cannot be picked over one that has one.
+
+**Cost delta per DLMM call, against df091b8, on the stxer run above:**
+- runtime: +782,129 (+19.8 %);
+- read_count: +73;
+- read_length: +407,792.
+
+A first version that called core `get-bin-price` once per pool through `get-pool` cost +1,172,194 runtime and +138 reads. Most of the remaining delta is loading the core and pool contracts once each. In `smart-swap` the pick runs twice per DLMM stage (capacity, then swap). Caching it in `dlmm-stage` and passing it to `amm-leg` would halve that, at the cost of touching the private leg signatures.
+
+Not addressed here: picking by price **at the caller's limit** (walking the capacity of all three pools and splitting across them) would fill more, but costs three bin walks. The patch is the minimal change that stops the router from preferring a pool whose price is off-market.
+
+## Files
+
+- `simulations/nilo-dlmm-pick.js`: the pick, per-pool state, and the A/B comparison on df091b8.
+- `simulations/nilo-dlmm-pick-compare.js`: the same scenario on df091b8 and on the fix, with execution costs.
+- `simulations/nilo-dlmm-pick-fix.clar.txt`: the replacement block.
+- `dlmm-pick-price.patch`: the same as a diff of `contracts/swap-router-sbtc-stx-jing-v5-3.clar`.

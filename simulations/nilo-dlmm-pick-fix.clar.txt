@@ -1,0 +1,87 @@
+;; The DLMM pool for a leg: among the pools holding a fair share of the asset
+;; the leg buys (at least 1% of the deepest pool's balance, so a dust remainder
+;; cannot win on price alone), the one whose active bin quotes the taker best
+;; (selling sBTC buys STX: the fewest sats per STX; selling STX buys sBTC: the
+;; most). A pool's balance says nothing about its price: an out-of-range pool
+;; can hold the most of an asset while quoting far off the market. With a
+;; single eligible pool no price is read. Ties go to the lower number; with no
+;; pool holding the asset, u1 (the leg then fills nothing, as before).
+(define-private (dlmm-pick (sell-sbtc bool))
+  (let (
+      (d1 (dlmm-depth DLMM_POOL_1 sell-sbtc))
+      (d2 (dlmm-depth DLMM_POOL_2 sell-sbtc))
+      (d3 (dlmm-depth DLMM_POOL_3 sell-sbtc))
+      (floor (/ (if (> d1 d2) (if (> d1 d3) d1 d3) (if (> d2 d3) d2 d3)) u100))
+      (e1 (and (> d1 u0) (>= d1 floor)))
+      (e2 (and (> d2 u0) (>= d2 floor)))
+      (e3 (and (> d3 u0) (>= d3 floor)))
+    )
+    (if (not (or (and e1 e2) (and e1 e3) (and e2 e3)))
+      (if e2 u2 (if e3 u3 u1))
+      (let (
+          ;; all three pools are bps-15: one read of the core's factor list
+          ;; prices every active bin locally (core get-bin-price, inlined)
+          (factors (unwrap-panic (unwrap-panic
+            (contract-call? DLMM_CORE get-bin-factors-by-step DLMM_BIN_STEP)
+          )))
+          (q1 (if e1 (dlmm-quote (unwrap-panic (contract-call? DLMM_POOL_1 get-pool-for-swap (not sell-sbtc))) factors) none))
+          (q2 (if e2 (dlmm-quote (unwrap-panic (contract-call? DLMM_POOL_2 get-pool-for-swap (not sell-sbtc))) factors) none))
+          (q3 (if e3 (dlmm-quote (unwrap-panic (contract-call? DLMM_POOL_3 get-pool-for-swap (not sell-sbtc))) factors) none))
+        )
+        (if (and (not (dlmm-better q2 q1 sell-sbtc)) (not (dlmm-better q3 q1 sell-sbtc)))
+          u1
+          (if (not (dlmm-better q3 q2 sell-sbtc))
+            u2
+            u3
+          )
+        )
+      )
+    )
+  )
+)
+
+(define-constant DLMM_BIN_STEP u15)
+
+;; active-bin price of a pool, as core get-bin-price computes it
+(define-private (dlmm-quote
+    (p {
+      pool-id: uint,
+      pool-name: (string-ascii 32),
+      core-address: principal,
+      fee-address: principal,
+      x-token: principal,
+      y-token: principal,
+      bin-step: uint,
+      initial-price: uint,
+      active-bin-id: int,
+      protocol-fee: uint,
+      provider-fee: uint,
+      variable-fee: uint,
+    })
+    (factors (list 1001 uint))
+  )
+  (if (is-eq (get bin-step p) DLMM_BIN_STEP)
+    (some (/ (* (get initial-price p)
+      (unwrap-panic (element-at? factors (to-uint (+ (get active-bin-id p) DLMM_CENTER_BIN))))
+    ) DLMM_PRICE_SCALE))
+    none
+  )
+)
+
+;; is quote a strictly better than quote b for the taker
+(define-private (dlmm-better
+    (a (optional uint))
+    (b (optional uint))
+    (sell-sbtc bool)
+  )
+  (match a
+    pa (match b
+      pb (if sell-sbtc
+        (< pa pb)
+        (> pa pb)
+      )
+      true
+    )
+    false
+  )
+)
